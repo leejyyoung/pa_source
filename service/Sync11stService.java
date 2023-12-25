@@ -1,0 +1,410 @@
+package com.cware.partner.sync.service;
+
+import java.sql.Timestamp;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+import com.cware.partner.common.code.Application;
+import com.cware.partner.common.code.CdcReason;
+import com.cware.partner.common.code.Origin;
+import com.cware.partner.common.code.PaGroup;
+import com.cware.partner.common.code.PaSaleGb;
+import com.cware.partner.common.code.PaStatus;
+import com.cware.partner.common.code.SaleGb;
+import com.cware.partner.common.service.CommonService;
+import com.cware.partner.sync.domain.SyncResult;
+import com.cware.partner.sync.domain.entity.Goods;
+import com.cware.partner.sync.domain.entity.Pa11stGoods;
+import com.cware.partner.sync.domain.entity.Pa11stOriginMapping;
+import com.cware.partner.sync.domain.entity.PaGoodsTarget;
+import com.cware.partner.sync.domain.entity.PaSaleNoGoods;
+import com.cware.partner.sync.domain.id.PaGoodsId;
+import com.cware.partner.sync.repository.Pa11stGoodsRepository;
+import com.cware.partner.sync.repository.Pa11stOriginMappingRepository;
+import com.cware.partner.sync.repository.PaBrandMappingRepository;
+import com.cware.partner.sync.repository.PaSaleNoGoodsRepository;
+
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@Service
+public class Sync11stService extends PartnerSyncService {
+
+	@Autowired
+	private CommonService commonRepository;
+
+	@Autowired
+	private Pa11stGoodsRepository partnerGoodsRepository;
+
+	@Autowired
+	private Pa11stOriginMappingRepository originMappingRepository;
+
+	@Autowired
+	private PaBrandMappingRepository brandMappingRepository;
+
+//	@Autowired
+//	private PaCustCnShipCostRepository cnShipCostRepository;
+
+	@Autowired
+	private PaSaleNoGoodsRepository saleNoGoodsRepository;
+
+	@Async("partnerAsyncExecutor")
+	@Transactional(propagation = Propagation.REQUIRES_NEW)
+	public CompletableFuture<SyncResult> asyncService(Goods goods, PaGoodsTarget target) {
+		boolean result = syncProduct(goods, target);
+		SyncResult sync = SyncResult.builder().isSync(result).target(target).build();
+		return CompletableFuture.completedFuture(sync);
+	}
+
+	@Transactional(propagation = Propagation.REQUIRES_NEW)
+	public boolean syncProduct(Goods goods, PaGoodsTarget target) {
+		tag = "11번가 동기화";
+
+		target.setMediaCode(PaGroup.SK11ST.mediaCode());
+
+		log.info("{} -------> {}", tag, target);
+
+		Optional<Pa11stGoods> optional = partnerGoodsRepository
+				.findById(new PaGoodsId(target.getPaGroupCode(), target.getPaCode(), target.getGoodsCode()));
+		Pa11stGoods partnerGoods;
+		Timestamp procDate = commonRepository.currentDate();
+
+		// 재입점, 데이터 동기화
+		// 해당 상품코드에 대해서 각 엔티티 별로 동기화를 해야하는지 판별하여 처리
+		// PartnerGoods를 계속 가져가므로, 한번 동기화 플래그 설정하며 이후에는 굳이 하지 않음
+		if (optional.isPresent()) {
+			partnerGoods = optional.get();
+			target.setPartnerGoods(partnerGoods);
+
+			// 마지막 동기화일시 마이그레이션
+			if (partnerGoods.getLastSyncDate() == null) {
+				partnerGoods.setLastSyncDate(partnerGoods.getModifyDate().after(goods.getPaGoods().getLastSyncDate())
+						? goods.getPaGoods().getLastSyncDate()
+						: partnerGoods.getModifyDate());
+			}
+
+			boolean isTransTarget = false;
+			boolean result;
+
+			// 재입점 처리
+			isTransTarget = syncForSale(target);
+
+			// 정보고시 동기화
+			result = syncGoodsOfferModify(goods.getOfferType(), target);
+			isTransTarget = isTransTarget || result;
+
+			// 상품정보변경 동기화
+			result =  syncPaGoods(goods, target);
+			isTransTarget = isTransTarget || result;
+
+			// 단품정보변경 동기화
+			result = syncGoodsDt(goods.getGoodsDtList(), target);
+			isTransTarget = isTransTarget || result;
+
+			// 이미지 동기화
+			result = syncGoodsImage(goods.getGoodsImage(), target);
+			isTransTarget = isTransTarget || result;
+
+			// 가격변경 동기화
+			result = syncGoodsPriceMoidfy(goods.getGoodsPrice(),goods.getLmsdCode(), target);
+			isTransTarget = isTransTarget || result;
+
+			// 프로모션변경 동기화
+			result = syncPromoModifyTarget(goods, target);
+			isTransTarget = isTransTarget || result;
+
+			// 공지사항 동기화
+			result = syncPaNotice(goods, target);
+			isTransTarget = isTransTarget || result;
+
+			// 배송비 동기화
+			result = syncShipCost(goods.getPaCustShipCost(), target);
+			isTransTarget = isTransTarget || result;
+
+			if (isTransTarget) {
+				partnerGoods.setTransTargetYn("1");
+				partnerGoods.setLastSyncDate(procDate);
+				partnerGoods.setModifyDate(procDate);
+				partnerGoods.setModifyId(Application.ID.code());
+
+				if (PaStatus.REJECT.code().equals(partnerGoods.getPaStatus())
+						&& SaleGb.FORSALE.code().equals(goods.getSaleGb())) {
+					partnerGoods.setPaSaleGb(PaSaleGb.FORSALE.code());
+				}
+
+				partnerGoodsRepository.save(partnerGoods);
+
+				// 딜 상품 타겟팅
+				partnerGoodsRepository.enableTransTargetDeal(partnerGoods.getGoodsCode(), Application.ID.code());
+			}
+
+			return isTransTarget;
+		}
+
+		// 신규입점
+		partnerGoods = Pa11stGoods.builder().goodsCode(target.getGoodsCode())
+				.paCode(target.getPaCode())
+				.paGroupCode(target.getPaGroupCode())
+				.paSaleGb(PaSaleGb.FORSALE.code())
+				.paStatus(PaStatus.REQUEST.code())
+				.transTargetYn("1")
+				.transSaleYn("0")
+				.transOrderAbleQty(target.getPartnerStockQty())
+				.lastSyncDate(procDate)
+				.massTargetYn("0")
+				.insertId(Application.ID.code())
+				.insertDate(procDate)
+				.modifyId(Application.ID.code())
+				.modifyDate(procDate)
+				.build();
+
+		target.setPartnerGoods(partnerGoods);
+
+		// 표준카테고리매핑
+		partnerGoods.setPaLmsdKey(getLmsdKey(goods.getLmsdCode(), target));
+		if (partnerGoods.getPaLmsdKey() == null) return false;
+
+		// 정보고시 동기화
+		if (!syncGoodsOffer(goods.getOfferType(), target)) return false;
+
+		// 원산지코드매핑
+		mappingOriginCode(goods.getOriginCode(), target);
+
+		// 브랜드매핑
+		partnerGoods.setBrandNo(brandMappingRepository.find11stMapping(goods.getBrandCode()));
+
+		// 상품 기본 동기화
+		partnerGoodsRepository.save(partnerGoods);
+
+		// 가격 동기화
+		syncGoodsPrice(goods.getGoodsPrice(),goods.getLmsdCode(), target);
+
+		// 프로모션 동기화
+		syncPromoTarget(goods, target);
+
+		// 이미지 동기화
+		syncGoodsImage(goods.getGoodsImage(), target);
+
+		// 단품 동기화
+		syncGoodsDt(goods.getGoodsDtList(), target);
+
+		// 공지사항 동기화
+		syncPaNotice(goods, target);
+
+		// 배송비 동기화
+		syncShipCost(goods.getPaCustShipCost(), target);
+
+		// 제휴입점요청처리
+		requestSyncPartner(target);
+
+		return true;
+	}
+
+	private boolean mappingOriginCode(String originCode, PaGoodsTarget target) {
+
+		Pa11stGoods partnerGoods = (Pa11stGoods) target.getPartnerGoods();
+		if (Origin.ETC.code().equals(originCode)) {
+			partnerGoods.setOrgnTypCd("03");
+		} else if (Origin.KOREA.code().equals(originCode)) {
+			partnerGoods.setOrgnTypCd("01");
+		} else {
+			partnerGoods.setOrgnTypCd("02");
+			Optional<Pa11stOriginMapping> optional = originMappingRepository.findById(originCode);
+			if (optional.isPresent()) {
+				partnerGoods.setOrgnTypDtlsCd(optional.get().getOrgnTypDtlsCd());
+			} else {
+				partnerGoods.setOrgnTypCd("03");
+			}
+		}
+		return true;
+	}
+
+
+	// 재입점
+	private boolean syncForSale (PaGoodsTarget target) {
+
+		Pa11stGoods partnerGoods = (Pa11stGoods)target.getPartnerGoods();
+
+		// 입점완료상태이면서 판매중지 상태인 경우 재입점 처리
+		if (PaStatus.COMPLETE.code().equals(partnerGoods.getPaStatus())
+				&& PaSaleGb.SUSPEND.code().equals(partnerGoods.getPaSaleGb()) && "1".equals(target.getAutoYn())) {
+			String syncNote = "상품 재입점";
+			Timestamp currentDate = commonService.currentDate();
+
+			partnerGoods.setTransSaleYn("1");
+			partnerGoods.setPaSaleGb(PaSaleGb.FORSALE.code());
+			partnerGoods.setModifyId(Application.ID.code());
+			partnerGoods.setModifyDate(currentDate);
+			partnerGoodsRepository.save(partnerGoods);
+			logSync(CdcReason.SALE_START.code(), syncNote, target);
+			return true;
+		} else if (PaStatus.REJECT.code().equals(partnerGoods.getPaStatus()) && "1".equals(target.getAutoYn())) { // 반려건 입점요청
+			String syncNote = "반려상품 입점요청";
+			Timestamp currentDate = commonService.currentDate();
+			partnerGoods.setPaStatus(PaSaleGb.REQUEST.code());
+			partnerGoods.setPaSaleGb(PaSaleGb.FORSALE.code());
+			partnerGoods.setModifyId(Application.ID.code());
+			partnerGoods.setModifyDate(currentDate);
+			partnerGoodsRepository.save(partnerGoods);
+			logSync(CdcReason.SALE_START.code(), syncNote, target);
+		} else {
+			if (requestSyncPartner(target))
+				return true;
+		}
+
+		return false;
+
+	}
+
+	// 상품정보동기화
+	private boolean syncPaGoods (Goods goods, PaGoodsTarget target ) {
+
+		Pa11stGoods partnerGoods = (Pa11stGoods)target.getPartnerGoods();
+
+		if (goods.getPaGoods().getLastSyncDate().after(partnerGoods.getLastSyncDate())) {
+			String syncNote = "상품정보변경";
+			log.info("{} {} 상품: {} ", tag, syncNote, goods.getGoodsCode() );
+			mappingOriginCode(goods.getOriginCode(), target);
+			partnerGoods.setBrandNo(brandMappingRepository.find11stMapping(goods.getBrandCode()));
+			log.info("{} {} 상품: {} ", tag, syncNote, goods.getGoodsCode());
+			logSync(CdcReason.GOODS_MODIFY.code(), syncNote, target);
+			return true;
+		} else if (goods.getPaGoods().getLastDescribeSyncDate().after(partnerGoods.getLastSyncDate())) { // 기술서 변경되면 연동타겟으로 설정
+			String syncNote = "상품기술서변경";
+			log.info("{} {} 상품: {} ", tag, syncNote, goods.getGoodsCode() );
+			logSync(CdcReason.DESCRIBE_MODIFY.code(), syncNote, target);
+			return true;
+		}
+
+		return false;
+
+	}
+
+	// 고객부담배송비 (11번가 연동구조개선에서 별도 동기화처리)
+//	protected boolean syncShipCost(Goods goods, PaGoodsTarget target) {
+//
+//		PaCustShipCost shipCost = goods.getPaCustShipCost();
+//		boolean isDirty;
+//
+//		isDirty = syncShipCost(shipCost, target);
+//
+//		if (!shipCost.getShipCostCode().startsWith("CN")) return isDirty;
+//
+//
+//		log.info("조건부배송비 동기화");
+//
+//		// 레거시에서는 비동기영역에서 별도 처리하던 부분으로
+//		// 동일한 레벨로 별도 서비스 구현했으나 실제 로직이 의미가 없음.
+//		// 11번가 기준의 출고지기준 배송비 규격을 맞추기 위함으로 해석되어 상품동기화에 포함시킴
+//		String entpManSeq = goods.getDelyType().equals("10") ? "003" : goods.getShipManSeq();
+//		Optional<PaCustCnShipCost> optional = cnShipCostRepository.findOneByPaCodeAndEntpCodeAndEntpManSeqAndShipCostCodeOrderByCnCostSeqDesc
+//				(target.getPaCode(), shipCost.getEntpCode(), entpManSeq, shipCost.getShipCostCode());
+//
+//		// 동일 출고지/정책코드내에서 출고배송비가 바뀐경우에만 생성
+//		if (optional.isPresent() && shipCost.getOrdCost() == optional.get().getOrdCostAmt()) return false;
+//
+//		Timestamp currentDate = commonRepository.currentDate();
+//		PaCustCnShipCost cnShipCost = PaCustCnShipCost.builder()
+//				.cnCostSeq(cnShipCostRepository.getNextCnCostSeq())
+//				.paCode(target.getPaCode())
+//				.entpCode(shipCost.getEntpCode())
+//				.entpManSeq(entpManSeq)
+//				.shipCostCode(goods.getShipCostCode())
+//				.shipCostBaseAmt(shipCost.getShipCostBaseAmt())
+//				.ordCostAmt(shipCost.getOrdCost())
+//				.transCnCostYn("1")
+//				.insertId(Application.ID.code())
+//				.insertDate(currentDate)
+//				.modifyId(Application.ID.code())
+//				.modifyDate(currentDate)
+//				.build();
+//
+//		cnShipCostRepository.save(cnShipCost);
+//
+//		String syncNote = "조건부배송비 변경";
+//		log.info("{} {} 상품: {} ", tag, syncNote, goods.getGoodsCode() );
+//		logSync(CdcReason.SHIP_COST_APPLY.code(), syncNote, target);
+//		return isDirty;
+//
+//	}
+
+
+	// 판매중지처리
+	public int stopSale(String goodsCode) {
+		return stopSale(goodsCode, "%");
+	}
+
+	// 판매중지처리
+	public int stopSale(String goodsCode, String paCode) {
+		int result = partnerGoodsRepository.stopSale(goodsCode, paCode, Application.ID.code());
+
+		log.info("11번가 판매중지 상품: {} ({})", goodsCode, result );
+
+		return result;
+	}
+
+	// 제휴필터에서 호출
+	public boolean stopSale(PaGoodsTarget target) {
+		Optional<Pa11stGoods> optional = partnerGoodsRepository
+				.findById(new PaGoodsId(target.getPaGroupCode(), target.getPaCode(), target.getGoodsCode()));
+
+		if (!optional.isPresent()) return false;
+
+		Pa11stGoods partnerGoods = optional.get();
+		Timestamp currentDate = commonService.currentDate();
+
+		// 입점완료이고, 판매중인 경우 판매중단연동타겟팅 및 이력생성
+		if (PaStatus.COMPLETE.code().equals(partnerGoods.getPaStatus())
+				&& PaSaleGb.FORSALE.code().equals(partnerGoods.getPaSaleGb())) {
+
+			partnerGoods.setPaSaleGb(PaSaleGb.SUSPEND.code());
+			partnerGoods.setTransSaleYn("1");
+			partnerGoods.setModifyDate(currentDate);
+			partnerGoods.setModifyId(Application.ID.code());
+			partnerGoodsRepository.save(partnerGoods);
+
+			PaSaleNoGoods saleNo = PaSaleNoGoods.builder().paGroupCode(target.getPaGroupCode())
+					.paCode(target.getPaCode()).goodsCode(target.getGoodsCode())
+					.seqNo(saleNoGoodsRepository.getNextSeq(target.getPaGroupCode(), target.getPaCode(),
+							target.getGoodsCode()))
+					.paGoodsCode(partnerGoods.getProductNo()).paSaleGb(PaSaleGb.SUSPEND.code())
+					.note(target.getExceptNote()).insertId(Application.ID.code()).insertDate(currentDate).build();
+			saleNoGoodsRepository.save(saleNo);
+
+			// 딜 상품 타겟팅
+			partnerGoodsRepository.enableTransTargetDeal(partnerGoods.getGoodsCode(), Application.ID.code());
+
+			String syncNote = "제휴필터 판매중지";
+			log.info("{} {} 상품: {} ", tag, syncNote, target.getGoodsCode());
+			logSync(CdcReason.SALE_END.code(), syncNote, target);
+
+			return true;
+		} else if (PaStatus.COMPLETE.code().compareTo(partnerGoods.getPaStatus()) > 0
+				&& PaSaleGb.FORSALE.code().equals(partnerGoods.getPaSaleGb())) {
+			// 입점전 판매중 데이터가 존재하는 경우 필터메시지와 판매중단 업데이트 처리
+			partnerGoods.setPaStatus(PaStatus.REJECT.code());
+			partnerGoods.setPaSaleGb(PaSaleGb.SUSPEND.code());
+			partnerGoods.setReturnNote(target.getExceptNote());
+			partnerGoods.setModifyDate(currentDate);
+			partnerGoods.setModifyId(Application.ID.code());
+			partnerGoodsRepository.save(partnerGoods);
+		}
+
+		return false;
+	}
+
+	// 전송대상설정
+	public boolean enableTransTarget(String goodsCode, String paCode) {
+		int result = partnerGoodsRepository.enableTransTarget(goodsCode, paCode, Application.ID.code());
+
+		log.info("11번가 전송대상 상품: {} ({})", goodsCode, result );
+
+		return result > 0;
+	}
+}
